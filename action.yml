@@ -1,0 +1,130 @@
+name: atc publish
+description: >-
+  Publish the artifacts that a repo's atc.kdl or atc.toml declares to an
+  atc-server console, and optionally sign a release into a channel.
+author: Agency Tool Company
+branding:
+  icon: upload-cloud
+  color: gray-dark
+
+inputs:
+  token:
+    description: >-
+      Operator API key for the org (role org_operator, or org_hook_publisher
+      when the config declares hooks). Store it as a GitHub environment secret.
+    required: true
+  channel:
+    description: Server channel to publish into, for example `stable`.
+    required: true
+  version:
+    description: Version label, for example `v1.4.0`. Defaults to the tag or branch name.
+    required: false
+    default: ${{ github.ref_name }}
+  deliver:
+    description: >-
+      `true` signs a release of every artifact into the channel. Needs
+      `signing-key` and `org`. The action never publishes an unsigned release.
+    required: false
+    default: "false"
+  signing-key:
+    description: >-
+      The org signing key: the hex contents of the `<org>.key` file that
+      `atc org key generate` wrote. Required when `deliver` is `true`.
+    required: false
+    default: ""
+  org:
+    description: >-
+      Org id. Required when `deliver` is `true`, because the signing key is
+      filed under it. Otherwise the config's `server` block supplies it.
+    required: false
+    default: ""
+  server:
+    description: atc-server URL. Defaults to the config's `server` block.
+    required: false
+    default: ""
+  console-url:
+    description: >-
+      Base URL of the console, for the links in the job summary. Defaults to
+      `server`. No link is written when neither is set.
+    required: false
+    default: ""
+  config:
+    description: Path to atc.kdl or atc.toml. Defaults to upward discovery from the workspace.
+    required: false
+    default: ""
+  only:
+    description: Publish only these artifacts (newline- or space-separated). Refused with `deliver`.
+    required: false
+    default: ""
+  wait:
+    description: "`true` waits until each version is available. `deliver` implies it."
+    required: false
+    default: "false"
+  atc-track:
+    description: Release track of the atc CLI to install, `stable` or `nightly`.
+    required: false
+    default: stable
+  install-url:
+    description: >-
+      URL of the atc installer. `atc ci github` prints it, and so does the
+      CLI setup page of the console.
+    required: true
+
+outputs:
+  delivery-id:
+    description: The release the run created or reused. Empty without `deliver`.
+    value: ${{ steps.publish.outputs.delivery-id }}
+  version:
+    description: The version label that was published.
+    value: ${{ steps.publish.outputs.version }}
+  signed:
+    description: "`true` when this run signed the release. Empty without `deliver`."
+    value: ${{ steps.publish.outputs.signed }}
+  console-url:
+    description: Console link to the release, when a console URL is known.
+    value: ${{ steps.publish.outputs.console-url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install atc
+      shell: bash
+      env:
+        ATC_ACTION_PLATFORM: github
+        # Pinned: an ATC_ACTION_TEMP from the job env would move the key dir
+        # away from the path that the "Remove signing key" step removes.
+        ATC_ACTION_TEMP: ${{ runner.temp }}
+        ATC_ACTION_TRACK: ${{ inputs.atc-track }}
+        ATC_ACTION_INSTALL_URL: ${{ inputs.install-url }}
+      # Through bash, so a copy of the action that lost the executable bit runs.
+      run: bash "$GITHUB_ACTION_PATH/scripts/install-atc.sh"
+
+    # Every input reaches the script through env. A `${{ }}` inlined in `run:`
+    # is printed in the expanded script under debug logging, and it is a
+    # script-injection path.
+    - name: Publish
+      id: publish
+      shell: bash
+      env:
+        ATC_ACTION_PLATFORM: github
+        ATC_ACTION_TEMP: ${{ runner.temp }}
+        ATC_ACTION_WORKSPACE: ${{ github.workspace }}
+        ATC_ACTION_TOKEN: ${{ inputs.token }}
+        ATC_ACTION_SIGNING_KEY: ${{ inputs.signing-key }}
+        ATC_ACTION_CHANNEL: ${{ inputs.channel }}
+        ATC_ACTION_VERSION: ${{ inputs.version }}
+        ATC_ACTION_DELIVER: ${{ inputs.deliver }}
+        ATC_ACTION_ORG: ${{ inputs.org }}
+        ATC_ACTION_SERVER: ${{ inputs.server }}
+        ATC_ACTION_CONSOLE_URL: ${{ inputs.console-url }}
+        ATC_ACTION_CONFIG: ${{ inputs.config }}
+        ATC_ACTION_ONLY: ${{ inputs.only }}
+        ATC_ACTION_WAIT: ${{ inputs.wait }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/publish.sh"
+
+    # publish.sh removes its key directory on exit. This step covers a run that
+    # was killed before that trap ran, which matters on a self-hosted runner.
+    - name: Remove signing key
+      if: always()
+      shell: bash
+      run: rm -rf -- "$RUNNER_TEMP/atc-action-home"

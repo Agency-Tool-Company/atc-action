@@ -1,0 +1,830 @@
+# Generated file: the atc-publish job and the scripts it runs.
+# Do not edit it. A change to it is lost when it is generated again.
+# atc publish for GitLab CI.
+#
+# Secrets are CI/CD variables, never inputs: GitLab interpolates inputs into
+# the expanded YAML, which the pipeline editor shows. Store ATC_TOKEN and
+# ATC_SIGNING_KEY as masked, protected variables scoped to the environment.
+#
+# To change rules, needs or tags, define a job named atc-publish in your own
+# file: GitLab merges it over this one. Do not set its script or its
+# after_script: GitLab replaces them, and after_script removes the key
+# directory of a killed job.
+spec:
+  inputs:
+    channel:
+      description: Server channel to publish into, for example `stable`.
+    version:
+      description: Version label. The default is the tag or branch name.
+      default: $CI_COMMIT_REF_NAME
+    deliver:
+      description: >-
+        true signs a release of every artifact into the channel. Needs the
+        ATC_SIGNING_KEY variable and the org input. Never unsigned.
+      type: boolean
+      default: false
+    org:
+      description: Org id. Required with deliver, because the key is filed under it.
+      default: ""
+    server:
+      description: atc-server URL. The default is the config's server block.
+      default: ""
+    console-url:
+      description: Console base URL for the summary link. The default is server.
+      default: ""
+    config:
+      description: Path to atc.kdl or atc.toml. The default is upward discovery.
+      default: ""
+    only:
+      description: Publish only these artifacts (space-separated). Refused with deliver.
+      default: ""
+    wait:
+      description: true waits until each version is available. deliver implies it.
+      type: boolean
+      default: false
+    atc-track:
+      description: Release track of the atc CLI to install.
+      options: [stable, nightly]
+      default: stable
+    install-url:
+      description: URL of the atc installer. `atc ci gitlab` prints it.
+    stage:
+      description: Stage of the atc-publish job. It must be in the project's stages.
+      default: deploy
+    image:
+      description: Job image. It needs bash. As root on an image with apt-get or apk, curl, jq and CA certificates are installed when missing.
+      default: debian:bookworm-slim
+    environment:
+      description: Environment of the job. Scope the ATC_ variables to it.
+      default: release
+---
+atc-publish:
+  stage: $[[ inputs.stage ]]
+  image: $[[ inputs.image ]]
+  environment:
+    name: $[[ inputs.environment ]]
+  # A release tag only: protect `v*` tags so they read the protected variables.
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+  variables:
+    ATC_ACTION_CHANNEL: "$[[ inputs.channel ]]"
+    ATC_ACTION_VERSION: "$[[ inputs.version ]]"
+    ATC_ACTION_ORG: "$[[ inputs.org ]]"
+    ATC_ACTION_SERVER: "$[[ inputs.server ]]"
+    ATC_ACTION_CONSOLE_URL: "$[[ inputs.console-url ]]"
+    ATC_ACTION_CONFIG: "$[[ inputs.config ]]"
+    ATC_ACTION_ONLY: "$[[ inputs.only ]]"
+    ATC_ACTION_TRACK: "$[[ inputs.atc-track ]]"
+    ATC_ACTION_INSTALL_URL: "$[[ inputs.install-url ]]"
+  script:
+    - |
+      command -v bash > /dev/null 2>&1 || {
+        echo "error: image: the atc-publish job needs bash; set the image input to an image that has it" >&2
+        exit 1
+      }
+      # The two boolean inputs are set here, not under variables. An input
+      # that fills a whole YAML value keeps its type, and a job variable
+      # cannot be a boolean. Inside this script it is plain text.
+      export ATC_ACTION_DELIVER=$[[ inputs.deliver ]] ATC_ACTION_WAIT=$[[ inputs.wait ]]
+      ATC_ACTION_DIR="${TMPDIR:-/tmp}/atc-action-scripts-$CI_JOB_ID"
+      rm -rf -- "$ATC_ACTION_DIR"
+      mkdir -m 700 -- "$ATC_ACTION_DIR"
+      cat > "$ATC_ACTION_DIR/install-atc.sh" << 'ATC_ACTION_EOF_INSTALL_ATC'
+      #!/usr/bin/env bash
+      # Install the atc CLI for the atc action. It downloads the atc installer
+      # from the install-url input. The installer verifies the signed release
+      # index and installs into <temp root>/atc-bin. The platform adapter then
+      # puts the bin directory on PATH for the later steps, or the caller does.
+      #
+      # Usage: install-atc.sh
+      #
+      # Required env (set by the runner, action.yml or run.sh):
+      #   ATC_ACTION_PLATFORM   the platform adapter to load (see platform.sh)
+      #   ATC_ACTION_TEMP       the temp root
+      #   ATC_ACTION_TRACK      stable or nightly
+      #   ATC_ACTION_INSTALL_URL  the installer URL, the install-url input. It has
+      #                           no default: `atc ci <platform>` prints it. It
+      #                           must be https, and curl follows no redirect to
+      #                           another scheme.
+      #   and the runner variables that the adapter names
+      set -euo pipefail
+
+      case "${BASH_SOURCE[0]}" in
+        */*) script_dir="${BASH_SOURCE[0]%/*}" ;;
+        *) script_dir=. ;;
+      esac
+      # shellcheck source=platform.sh disable=SC1091
+      . "$script_dir/platform.sh"
+      if ! platform_adapter "${ATC_ACTION_PLATFORM:-}"; then
+        printf "error: ATC_ACTION_PLATFORM must be %s, not '%s'\n" \
+          "$(platform_list fail ', ' ' or ')" "${ATC_ACTION_PLATFORM:-}" >&2
+        exit 1
+      fi
+      # shellcheck source=/dev/null disable=SC2154 # platform_adapter sets adapter
+      . "$adapter"
+
+      temp="${ATC_ACTION_TEMP:-}"
+      [ -n "$temp" ] || fail temp "set ATC_ACTION_TEMP to a private temp directory"
+      require_path_env
+      track="${ATC_ACTION_TRACK:-stable}"
+      url="${ATC_ACTION_INSTALL_URL:-}"
+      [ -n "$url" ] ||
+        fail install-url "$(input_name install-url) is empty. Set it to the installer URL that atc ci $ATC_ACTION_PLATFORM prints."
+      case "$url" in
+        https://*) ;;
+        *) fail install-url "$(input_name install-url) must be an https:// URL, not $url" ;;
+      esac
+
+      case "$track" in
+        stable | nightly) ;;
+        *) fail atc-track "$(input_name atc-track bare) must be stable or nightly, not $track" ;;
+      esac
+
+      bin_dir="$temp/atc-bin"
+      installer="$temp/atc-install.sh"
+      mkdir -p "$bin_dir"
+
+      curl -q -fsSL --proto =https --proto-redir =https --retry 5 --retry-delay 2 -o "$installer" "$url"
+      ATC_TRACK="$track" ATC_BIN_DIR="$bin_dir" ATC_INSTALL_SKILL=0 sh "$installer"
+      rm -f "$installer"
+
+      add_to_path "$bin_dir"
+      "$bin_dir/atc" --version
+      ATC_ACTION_EOF_INSTALL_ATC
+      cat > "$ATC_ACTION_DIR/publish.sh" << 'ATC_ACTION_EOF_PUBLISH'
+      #!/usr/bin/env bash
+      # The publish step of the atc action. It lints the atc.kdl or atc.toml, runs
+      # `atc ota publish`, and reports the result as outputs and a summary. With
+      # deliver=true it signs the release with the org key and fails unless the
+      # release is signed.
+      #
+      # ATC_ACTION_PLATFORM names the platform adapter, platform-<name>.sh, beside
+      # this script. The adapter holds all the code that differs per platform:
+      # platform.sh lists its functions.
+      #
+      # The org key reaches atc the way it does on a laptop: as
+      # $ATC_CONFIG_HOME/org-keys/<org>.key. ATC_CONFIG_HOME is a fresh 0700
+      # directory under the temp root, so no login or key from an earlier job on a
+      # self-hosted runner is read. An EXIT trap deletes it.
+      #
+      # The key never appears in argv, in a process environment of atc, or in the
+      # log: it is written with the printf builtin and only the file path is ever
+      # printed.
+      #
+      # Usage: publish.sh   (inputs arrive as env; see action.yml and run.sh)
+      #
+      # Required env:
+      #   ATC_ACTION_PLATFORM   the platform adapter to load
+      #   ATC_ACTION_TEMP       the temp root
+      #   ATC_ACTION_TOKEN, ATC_ACTION_CHANNEL, ATC_ACTION_VERSION
+      #   and the runner variables that the adapter names
+      # Optional env:
+      #   ATC_ACTION_DELIVER, ATC_ACTION_SIGNING_KEY, ATC_ACTION_ORG,
+      #   ATC_ACTION_SERVER, ATC_ACTION_CONSOLE_URL, ATC_ACTION_CONFIG,
+      #   ATC_ACTION_ONLY, ATC_ACTION_WAIT
+      #   ATC_ACTION_WORKSPACE     trimmed from lint file paths
+      #   ATC_ACTION_ATC   the atc binary (default: atc on PATH; tests set a stub)
+      #   and the optional env of the adapter
+      set -euo pipefail
+
+      # Shell-only path splitting: an external dirname would inherit the secrets,
+      # which are still in the environment here.
+      case "${BASH_SOURCE[0]}" in
+        */*) script_dir="${BASH_SOURCE[0]%/*}" ;;
+        *) script_dir=. ;;
+      esac
+      # shellcheck source=platform.sh disable=SC1091
+      . "$script_dir/platform.sh"
+      if ! platform_adapter "${ATC_ACTION_PLATFORM:-}"; then
+        printf "error: ATC_ACTION_PLATFORM must be %s, not '%s'\n" \
+          "$(platform_list fail ', ' ' or ')" "${ATC_ACTION_PLATFORM:-}" >&2
+        exit 1
+      fi
+      # shellcheck source=/dev/null disable=SC2154 # platform_adapter sets adapter
+      . "$adapter"
+
+      # output_value <name> <value>: refuse a value that the outputs cannot carry.
+      # A line break would add a line to the output file. The adapter adds the
+      # rules of its own output file.
+      output_value() {
+        if [[ "$2" == *[$'\r\n']* ]]; then
+          fail outputs "$1 holds a line break, which a step output cannot carry"
+        fi
+        output_rules "$1" "$2"
+      }
+
+      # ── Environment ───────────────────────────────────────────────────────────────
+
+      temp="${ATC_ACTION_TEMP:-}"
+      [ -n "$temp" ] || fail temp "set ATC_ACTION_TEMP to a private temp directory"
+      require_platform_env
+
+      atc_bin="${ATC_ACTION_ATC:-atc}"
+      # Trimmed, as the key is below: a platform masks only the exact secret string,
+      # so the mask must get the string that atc uses.
+      token_raw="${ATC_ACTION_TOKEN:-}"
+      # Trimmed in the shell: a `tr` child would inherit the secrets, which are still
+      # in the environment here.
+      token="${token_raw//[[:space:]]/}"
+      signing_key_raw="${ATC_ACTION_SIGNING_KEY:-}"
+      channel="${ATC_ACTION_CHANNEL:-}"
+      version="${ATC_ACTION_VERSION:-}"
+      deliver="${ATC_ACTION_DELIVER:-false}"
+      org="${ATC_ACTION_ORG:-}"
+      server="${ATC_ACTION_SERVER:-}"
+      console_url="${ATC_ACTION_CONSOLE_URL:-$server}"
+      config="${ATC_ACTION_CONFIG:-}"
+      only="${ATC_ACTION_ONLY:-}"
+      wait_flag="${ATC_ACTION_WAIT:-false}"
+      workspace="${ATC_ACTION_WORKSPACE:-}"
+      # The secrets now live only in shell variables. Remove them from the
+      # environment so no child process (lint, publish, jq) inherits them. The token
+      # goes back into the environment for the publish call only.
+      unset ATC_ACTION_TOKEN ATC_ACTION_SIGNING_KEY
+      # After the unset: rm is the first child process, and it gets no secret.
+      clear_outputs
+
+      # Not in a command substitution: fail's error line must reach the log.
+      require_bool() {
+        case "$2" in
+          true | false) ;;
+          *) fail "$1" "$(input_name "$1" bare) must be true or false, not '$2'" ;;
+        esac
+      }
+
+      # ── Inputs ────────────────────────────────────────────────────────────────────
+
+      require_bool deliver "$deliver"
+      require_bool wait "$wait_flag"
+      [ -n "$token" ] || fail token "the token is empty. $(token_hint)"
+      [ -n "$channel" ] || fail channel "$(input_name channel) is empty"
+      [ -n "$version" ] || fail version "$(input_name version) is empty"
+      # Check the outputs that come from inputs now, so a bad value fails before
+      # anything is published. The console link is checked in the form it takes.
+      output_value version "$version"
+      [ -z "$console_url" ] || output_value console-url "${console_url%/}/channels/deliveries/x"
+      secret_as_stored token "$token_raw" "$token"
+      mask "$token"
+
+      only_args=()
+      # Split on whitespace, but never expand a glob such as `app*` against the cwd.
+      set -f
+      for name in $only; do
+        only_args+=(--only "$name")
+      done
+      set +f
+      if [ "$deliver" = true ] && [ "${#only_args[@]}" -gt 0 ]; then
+        fail only "$(input_name only bare) cannot be used with $(input_name deliver bare): a release carries every artifact in the config"
+      fi
+
+      signing_key=""
+      if [ "$deliver" = true ]; then
+        [ -n "$signing_key_raw" ] || fail signing-key "deliver is true and $(secret_name signing-key) is empty. The action never publishes an unsigned release. Pass the contents of the <org>.key file that 'atc org key generate' wrote."
+        [ -n "$org" ] || fail org "deliver is true and $(input_name org) is empty. The signing key is filed under the org id."
+        # The org names a file, so it must be one path component.
+        case "$org" in
+          '' | . | .. | */* | *[!A-Za-z0-9._-]*) fail org "$(input_name org bare) must be an org id (letters, digits, '.', '_', '-')" ;;
+        esac
+        signing_key="${signing_key_raw//[[:space:]]/}"
+        secret_as_stored signing-key "$signing_key_raw" "$signing_key"
+        # A platform masks only the exact secret string, so mask the trimmed form.
+        mask "$signing_key"
+        if ! [[ "$signing_key" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+          fail signing-key "$(secret_label signing-key bare) must be 64 hex characters (the <org>.key file). The value is not shown."
+        fi
+      fi
+
+      # ── Isolated config home ──────────────────────────────────────────────────────
+
+      home="$temp/atc-action-home"
+      rm -rf -- "$home"
+      cleanup() { rm -rf -- "$home"; }
+      trap cleanup EXIT
+      # A cancelled job gets TERM (or INT). Exiting from the handler runs the EXIT
+      # trap, so the key directory goes. KILL runs nothing: the cleanup step of the
+      # caller covers it.
+      trap 'exit 143' TERM
+      trap 'exit 130' INT
+      (
+        umask 077
+        mkdir -p "$home/org-keys"
+        if [ -n "$signing_key" ]; then
+          printf '%s\n' "$signing_key" > "$home/org-keys/$org.key"
+        fi
+      )
+
+      run_atc() {
+        ATC_CONFIG_HOME="$home" "$atc_bin" --non-interactive "$@"
+      }
+
+      config_args=()
+      [ -n "$config" ] && config_args=(-c "$config")
+
+      # ── Lint ──────────────────────────────────────────────────────────────────────
+
+      lint_out="$temp/atc-action-lint.json"
+      set +e
+      run_atc --json "${config_args[@]+"${config_args[@]}"}" config lint > "$lint_out"
+      lint_status=$?
+      set -e
+
+      if [ -s "$lint_out" ] && jq -e 'type == "object" and (.diagnostics | type == "array")' "$lint_out" > /dev/null 2>&1; then
+        lint_file="$(jq -r '.file' "$lint_out")"
+        [ -n "$workspace" ] && lint_file="${lint_file#"$workspace"/}"
+        while IFS= read -r diag; do
+          sev="$(jq -r '.severity' <<< "$diag")"
+          code="$(jq -r '.code' <<< "$diag")"
+          msg="$(jq -r '.message' <<< "$diag")"
+          line="$(jq -r '.line // empty' <<< "$diag")"
+          case "$sev" in error) level=error ;; *) level=warning ;; esac
+          diag "$level" "$lint_file" "$line" "$code" "$msg"
+        done < <(jq -c '.diagnostics[]' "$lint_out")
+        errors="$(jq -r '.errors' "$lint_out")"
+        [ "$errors" = 0 ] || fail "atc config lint" "the config has $errors error(s); nothing was published"
+      elif [ "$lint_status" -ne 0 ]; then
+        fail "atc config lint" "atc config lint failed (exit $lint_status) and wrote no report"
+      fi
+      rm -f "$lint_out"
+
+      # ── Publish ───────────────────────────────────────────────────────────────────
+
+      publish_args=(ota publish --channel "$channel" --version "$version")
+      publish_args+=("${only_args[@]+"${only_args[@]}"}")
+      [ -n "$server" ] && publish_args+=(--server "$server")
+      [ -n "$org" ] && publish_args+=(--org "$org")
+      [ "$deliver" = true ] && publish_args+=(--deliver)
+      [ "$wait_flag" = true ] && publish_args+=(--wait)
+
+      out_file="$temp/atc-action-publish.json"
+      err_file="$temp/atc-action-publish.err"
+      # stdout (the JSON report) goes to a file. stderr goes to the log live and to
+      # a file, so a failure can be explained. The token reaches atc only as env.
+      exec 3> "$out_file"
+      set +e
+      ATC_SERVER_TOKEN="$token" run_atc --json \
+        "${config_args[@]+"${config_args[@]}"}" "${publish_args[@]}" 2>&1 1>&3 3>&- |
+        tee "$err_file" >&2
+      statuses=("${PIPESTATUS[@]}")
+      set -e
+      exec 3>&-
+      publish_status="${statuses[0]}"
+
+      if [ "$publish_status" -ne 0 ]; then
+        # Under --json, atc writes its error as one document on stdout
+        # ({ok: false, code, message, fix_command, docs_url}), not as text on stderr.
+        # Read it from there; stderr still carries any progress lines.
+        err_code="" err_msg="" err_fix="" err_docs=""
+        if [ -s "$out_file" ] && jq -e 'type == "object" and .ok == false' "$out_file" > /dev/null 2>&1; then
+          err_code="$(jq -r '.code // empty' "$out_file")"
+          err_msg="$(jq -r '.message // empty' "$out_file")"
+          err_fix="$(jq -r '.fix_command // empty' "$out_file")"
+          err_docs="$(jq -r '.docs_url // empty' "$out_file")"
+        fi
+        # Both the error document and stderr are searched for the known failures.
+        haystack="$err_msg"$'\n'"$(cat "$err_file")"
+        case "$haystack" in
+          *'admin route not found'*)
+            fail "atc ota publish" "the server refused the token. Check that $(secret_name token) holds a live operator API key for this org with role org_operator (or org_hook_publisher when the config declares hooks)."
+            ;;
+          *'does not verify against an active org key'*)
+            fail "atc ota publish" "the server does not know this signing key. Register it with 'atc org key register --org $org' as an org admin, then re-run: the run adopts the release it created."
+            ;;
+        esac
+        if [ -n "$err_msg" ]; then
+          detail="${err_code:+$err_code: }$err_msg"
+          [ -n "$err_fix" ] && detail="$detail"$'\n'"fix: $err_fix"
+          [ -n "$err_docs" ] && detail="$detail"$'\n'"docs: $err_docs"
+          fail "atc ota publish" "$detail"
+        fi
+        fail "atc ota publish" "atc ota publish failed (exit $publish_status) and wrote no error report; see the log above"
+      fi
+
+      if ! { [ -s "$out_file" ] && jq -e 'type == "object"' "$out_file" > /dev/null 2>&1; }; then
+        fail "atc ota publish" "atc ota publish succeeded but wrote no JSON report"
+      fi
+
+      # ── Postflight and outputs ────────────────────────────────────────────────────
+
+      delivery_id="$(jq -r '.delivery_id // empty' "$out_file")"
+      signed="$(jq -r 'if has("signed") then (.signed | tostring) else "" end' "$out_file")"
+      published_version="$(jq -r '.version // empty' "$out_file")"
+
+      if [ "$deliver" = true ]; then
+        # `null` is a release an earlier publish already published, which this run
+        # reused without signing. That publish may have been unsigned on a channel
+        # where signing is optional, and nothing here can read its signatures. So it
+        # fails closed: the action promises a signed release.
+        case "$signed" in
+          true) ;;
+          null) fail "atc ota publish" "this content was already published as release $delivery_id by an earlier publish, and the action cannot prove that release is signed. Publish under a new version label." ;;
+          *) fail "atc ota publish" "release $delivery_id is not signed. Devices on a channel that requires signed releases will refuse it." ;;
+        esac
+      fi
+
+      link=""
+      if [ -n "$console_url" ] && [ -n "$delivery_id" ]; then
+        link="${console_url%/}/channels/deliveries/$delivery_id"
+      fi
+
+      # Check every value before the adapter opens the file: a refused value
+      # writes no output at all.
+      output_value delivery-id "$delivery_id"
+      output_value version "$published_version"
+      output_value signed "$signed"
+      output_value console-url "$link"
+      write_outputs "$delivery_id" "$published_version" "$signed" "$link"
+
+      # The backticks below are Markdown code spans, not command substitution.
+      # shellcheck disable=SC2016
+      {
+        printf '### atc publish\n\n'
+        printf '| Artifact | Kind | Version | State |\n|---|---|---|---|\n'
+        jq -r '.artifacts[]? | "| `\(.name)` | \(.kind) | `\(.version)` | \(.state) |"' "$out_file"
+        printf '\nChannel: `%s`\n' "$channel"
+        if [ -n "$delivery_id" ]; then
+          printf '\nRelease: `%s` (signed: %s)' "$delivery_id" "$signed"
+          [ -n "$link" ] && printf ' [open in console](%s)' "$link"
+          printf '\n\nNo device moves until an assignment, pin or deployment names the release.\n'
+        fi
+      } | write_summary
+
+      rm -f "$out_file" "$err_file"
+      ATC_ACTION_EOF_PUBLISH
+      cat > "$ATC_ACTION_DIR/run.sh" << 'ATC_ACTION_EOF_RUN'
+      #!/usr/bin/env bash
+      # The entry point of the atc action on a CI platform that runs it as a
+      # script. Its argument names the platform adapter, platform-<name>.sh, beside
+      # this script. Only an adapter with run_defaults can be named (see
+      # platform.sh).
+      #
+      # This script does the work that every such platform needs:
+      #   1. It moves ATC_TOKEN and ATC_SIGNING_KEY into ATC_ACTION_TOKEN and
+      #      ATC_ACTION_SIGNING_KEY, unless those are set, and unsets the pair.
+      #      So the installer and atc never inherit a secret.
+      #   2. It defaults ATC_ACTION_VERSION and ATC_ACTION_WORKSPACE to the values
+      #      that the adapter's run_defaults gives: the tag or branch name, and the
+      #      checkout directory.
+      #   3. It makes sure curl, jq and CA certificates are present. When one is
+      #      missing and the job runs as root with apt-get or apk, it installs it.
+      #      Otherwise it fails and names what is missing.
+      #   4. It makes a private 0700 temp dir, $TMPDIR/atc-action-<run id>. An
+      #      EXIT trap removes it, also after TERM or INT.
+      #   5. It runs install-atc.sh, then publish.sh with the new atc on PATH. The
+      #      exit status of publish.sh is the exit status of this script.
+      #
+      # Usage: run.sh <platform>   (inputs arrive as env; see publish.sh)
+      # Optional env:
+      #   SSL_CERT_FILE   the CA bundle to check (default: the usual system paths)
+      set -euo pipefail
+
+      # Shell-only path splitting: an external dirname would run before the secrets
+      # leave the environment, and inherit them.
+      self="${BASH_SOURCE[0]}"
+      case "$self" in
+        */*) here="$(cd "${self%/*}" && pwd)" ;;
+        *) here="$PWD" ;;
+      esac
+
+      fail() {
+        printf 'error: %s: %s\n' "$1" "$2" >&2
+        exit 1
+      }
+
+      # shellcheck source=platform.sh disable=SC1091
+      . "$here/platform.sh"
+      platform="${1:-}"
+      # shellcheck disable=SC2154 # platform_adapter sets adapter
+      if ! platform_adapter "$platform" || ! platform_defines "$adapter" run_defaults; then
+        fail usage "run.sh <$(platform_list run_defaults '|' '|')>, not '$platform'"
+      fi
+      # shellcheck source=/dev/null # platform_adapter sets adapter
+      . "$adapter"
+      run_defaults
+
+      # ── 1. Secrets ────────────────────────────────────────────────────────────────
+
+      [ -n "${ATC_ACTION_TOKEN:-}" ] || ATC_ACTION_TOKEN="${ATC_TOKEN:-}"
+      [ -n "${ATC_ACTION_SIGNING_KEY:-}" ] || ATC_ACTION_SIGNING_KEY="${ATC_SIGNING_KEY:-}"
+      unset ATC_TOKEN ATC_SIGNING_KEY
+      # Shell variables only, not exported: no child (id, mkdir, the package
+      # manager, the installer) has them in its environment. The publish call alone
+      # gets them, as a prefix assignment. A pair the job set in the environment
+      # loses its export too.
+      export -n ATC_ACTION_TOKEN ATC_ACTION_SIGNING_KEY
+
+      # without_secrets <command...>: run a command with the secrets unset, as
+      # defense in depth on top of the missing export.
+      without_secrets() (
+        unset ATC_ACTION_TOKEN ATC_ACTION_SIGNING_KEY
+        "$@"
+      )
+
+      # ── 2. Defaults ───────────────────────────────────────────────────────────────
+
+      export ATC_ACTION_PLATFORM="$platform"
+      export ATC_ACTION_VERSION="${ATC_ACTION_VERSION:-$default_version}"
+      export ATC_ACTION_WORKSPACE="${ATC_ACTION_WORKSPACE:-$default_workspace}"
+      # The dotenv file goes to the workspace root, not to the cwd of the job: the
+      # platform collects it from there.
+      if [ -z "${ATC_ACTION_OUTPUT_FILE:-}" ] && [ -n "$ATC_ACTION_WORKSPACE" ]; then
+        export ATC_ACTION_OUTPUT_FILE="$ATC_ACTION_WORKSPACE/atc-publish.env"
+      fi
+
+      # ── 3. Tools ──────────────────────────────────────────────────────────────────
+
+      have_ca() {
+        if [ -n "${SSL_CERT_FILE:-}" ]; then
+          [ -s "$SSL_CERT_FILE" ]
+          return
+        fi
+        local f
+        for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+          [ -s "$f" ] && return 0
+        done
+        return 1
+      }
+
+      # Sets missing to the packages that are not present. The package names are
+      # the same on apt-get and apk.
+      find_missing() {
+        missing=()
+        command -v curl > /dev/null || missing+=(curl)
+        command -v jq > /dev/null || missing+=(jq)
+        have_ca || missing+=(ca-certificates)
+      }
+
+      find_missing
+      if [ "${#missing[@]}" -gt 0 ]; then
+        # A failed install is not fatal here: the check below names what is still
+        # missing.
+        if [ "$(id -u)" = 0 ] && command -v apt-get > /dev/null; then
+          printf 'run.sh: installing %s with apt-get\n' "${missing[*]}" >&2
+          { without_secrets apt-get update -qq > /dev/null &&
+            without_secrets env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing[@]}" > /dev/null; } || true
+        elif [ "$(id -u)" = 0 ] && command -v apk > /dev/null; then
+          printf 'run.sh: installing %s with apk\n' "${missing[*]}" >&2
+          without_secrets apk add --no-cache -q "${missing[@]}" > /dev/null || true
+        fi
+        find_missing
+        if [ "${#missing[@]}" -gt 0 ]; then
+          fail tools "missing ${missing[*]}. Use an image that has them, or run the job as root on an image with apt-get or apk."
+        fi
+      fi
+
+      # ── 4. Temp dir ───────────────────────────────────────────────────────────────
+
+      # A path the job can name again: atc-action-<run id>. So a cleanup step that
+      # runs in another shell after a KILL can remove it.
+      # The id is reduced to safe characters. Without an id, a random directory.
+      run_id="${run_id//[!A-Za-z0-9_-]/}"
+      if [ -n "$run_id" ]; then
+        ATC_ACTION_TEMP="${TMPDIR:-/tmp}/atc-action-$run_id"
+        rm -rf -- "$ATC_ACTION_TEMP"
+        mkdir -m 700 -- "$ATC_ACTION_TEMP"
+      else
+        ATC_ACTION_TEMP="$(mktemp -d)"
+        chmod 700 "$ATC_ACTION_TEMP"
+      fi
+      trap 'rm -rf -- "$ATC_ACTION_TEMP"' EXIT
+      trap 'exit 143' TERM
+      trap 'exit 130' INT
+      export ATC_ACTION_TEMP
+
+      # ── 5. Install and publish ────────────────────────────────────────────────────
+
+      # The installer is downloaded code: it gets no secret.
+      without_secrets bash "$here/install-atc.sh"
+      PATH="$ATC_ACTION_TEMP/atc-bin:$PATH"
+      ATC_ACTION_TOKEN="$ATC_ACTION_TOKEN" ATC_ACTION_SIGNING_KEY="$ATC_ACTION_SIGNING_KEY" \
+        bash "$here/publish.sh"
+      ATC_ACTION_EOF_RUN
+      cat > "$ATC_ACTION_DIR/platform.sh" << 'ATC_ACTION_EOF_PLATFORM'
+      # shellcheck shell=bash
+      # The adapter loader of the atc action. install-atc.sh, publish.sh and run.sh
+      # source this file.
+      #
+      # Each platform has an adapter, platform-<name>.sh, in this directory. The
+      # adapter holds all the code that differs per platform. A copy of the action
+      # can hold only some of the adapters, so an error lists only the adapters
+      # that are present.
+      #
+      # An adapter defines these functions for publish.sh:
+      #   fail <title> <message>        report an error and exit 1
+      #   diag <level> <file> <line> <code> <message>   one lint diagnostic
+      #   mask <value>                  keep a secret out of the log
+      #   output_rules <name> <value>   refuse a value that the outputs cannot carry
+      #   write_outputs <delivery-id> <version> <signed> <console-url>
+      #   write_summary                 show the Markdown summary on stdin
+      #   clear_outputs                 remove outputs that an earlier run left
+      #   require_platform_env          check the runner variables it writes to
+      #   secret_name <token|signing-key>        what the user sets
+      #   secret_label <token|signing-key> [bare]   how a value check names it
+      #   input_name <input> [bare]     what the user sets for an input
+      #   token_hint                    how to supply the token
+      #   secret_as_stored <name> <raw> <trimmed>   refuse a secret that the
+      #                                 platform would not mask once trimmed
+      # For install-atc.sh:
+      #   require_path_env              check the runner variables for PATH
+      #   add_to_path <dir>             put <dir> on PATH for the later steps
+      # For run.sh, only on a platform that runs the action through run.sh:
+      #   run_defaults                  set default_version, default_workspace and
+      #                                 run_id from the platform's own variables
+      #
+      # The functions here use only shell builtins. The caller can still hold a
+      # secret in its environment, and an external command would inherit it.
+
+      case "${BASH_SOURCE[0]}" in
+        */*) platform_dir="${BASH_SOURCE[0]%/*}" ;;
+        *) platform_dir=. ;;
+      esac
+
+      # platform_adapter <name>: set adapter to the path of the adapter for <name>.
+      # Return 1 when <name> is not a lower-case word or has no adapter here.
+      platform_adapter() {
+        adapter=""
+        [[ "$1" =~ ^[a-z]+$ ]] || return 1
+        [ -f "$platform_dir/platform-$1.sh" ] || return 1
+        # shellcheck disable=SC2034 # the caller reads it
+        adapter="$platform_dir/platform-$1.sh"
+      }
+
+      # platform_defines <adapter file> <function>: true when the adapter defines
+      # the function. The adapter is read in a subshell, so its functions do not
+      # replace those of the caller.
+      platform_defines() {
+        # shellcheck source=/dev/null
+        (. "$1" && declare -F "$2" > /dev/null)
+      }
+
+      # platform_list <function> <separator> <last separator>: the names of the
+      # adapters here that define the function, joined, for example "a, b or c".
+      platform_list() {
+        local f name out="" n=0 i
+        local -a names=()
+        for f in "$platform_dir"/platform-*.sh; do
+          [ -f "$f" ] || continue
+          name="${f##*/platform-}"
+          name="${name%.sh}"
+          if platform_defines "$f" "$1"; then
+            names+=("$name")
+            n=$((n + 1))
+          fi
+        done
+        for ((i = 0; i < n; i++)); do
+          if [ "$i" -eq 0 ]; then
+            out="${names[0]}"
+          elif [ "$i" -eq $((n - 1)) ]; then
+            out="$out$3${names[i]}"
+          else
+            out="$out$2${names[i]}"
+          fi
+        done
+        printf '%s' "$out"
+      }
+      ATC_ACTION_EOF_PLATFORM
+      cat > "$ATC_ACTION_DIR/dotenv-adapter.sh" << 'ATC_ACTION_EOF_DOTENV_ADAPTER'
+      # shellcheck shell=bash
+      # The shared part of the adapters for the platforms that run the atc action
+      # through run.sh. Their platform-<name>.sh sources this file and adds the
+      # names and the hints of its own platform. platform.sh lists the functions
+      # that an adapter defines.
+      #
+      # Errors and lint diagnostics are plain lines on stderr. The outputs go to a
+      # dotenv file, and the summary goes to stdout. The user stores the secrets as
+      # CI variables, ATC_TOKEN and ATC_SIGNING_KEY, which run.sh reads. The
+      # platform masks those variables itself, so mask does nothing.
+      #
+      # Optional env:
+      #   ATC_ACTION_OUTPUT_FILE   the dotenv file for the outputs
+      #                            (default: atc-publish.env in the cwd)
+
+      fail() {
+        printf 'error: %s: %s\n' "$1" "$2" >&2
+        exit 1
+      }
+
+      diag() {
+        printf '%s: %s%s: %s: %s\n' "$1" "$2" "${3:+:$3}" "$4" "$5" >&2
+      }
+
+      mask() { :; }
+
+      # Only an allowlist passes. GitLab's dotenv report keeps quotes literally,
+      # cuts a value at `#`, and drops the whole report on a bad line without
+      # failing the job. A later step can `source` the file, so a shell character
+      # such as $, a backtick, ; or ( must not reach it.
+      dotenv_safe='^[A-Za-z0-9._:/@+%=~-]*$'
+      output_rules() {
+        if ! [[ "$2" =~ $dotenv_safe ]]; then
+          fail outputs "$1 holds a character other than letters, digits and ._:/@+%=~-, which the dotenv file does not carry"
+        fi
+        # A sourced file tilde-expands `~` at the start of a value and after `:`.
+        if [[ "$2" == '~'* || "$2" == *':~'* ]]; then
+          fail outputs "$1 starts with '~' or holds ':~', which a shell would expand when it sources the dotenv file"
+        fi
+      }
+
+      write_outputs() {
+        local file="${ATC_ACTION_OUTPUT_FILE:-atc-publish.env}"
+        # The checkout can hold a symlink with this name. Writing through it would
+        # overwrite the file it names.
+        if [ -L "$file" ]; then
+          fail outputs "$file is a symbolic link; refusing to write the outputs through it"
+        fi
+        {
+          printf 'ATC_PUBLISH_DELIVERY_ID=%s\n' "$1"
+          printf 'ATC_PUBLISH_VERSION=%s\n' "$2"
+          printf 'ATC_PUBLISH_SIGNED=%s\n' "$3"
+          printf 'ATC_PUBLISH_CONSOLE_URL=%s\n' "$4"
+        } > "$file"
+      }
+
+      write_summary() {
+        cat
+      }
+
+      # The file is written only after a successful publish. So a failed run would
+      # otherwise leave the earlier release id and `signed=true` for a later step.
+      clear_outputs() {
+        rm -f -- "${ATC_ACTION_OUTPUT_FILE:-atc-publish.env}"
+      }
+
+      require_platform_env() { :; }
+
+      # The secrets are CI variables that run.sh reads.
+      secret_name() {
+        if [ "$1" = token ]; then
+          printf 'the ATC_TOKEN variable'
+        else
+          printf 'the ATC_SIGNING_KEY variable'
+        fi
+      }
+
+      # The platform masks only the stored string. A stored secret with whitespace
+      # around or inside it is used trimmed, and the trimmed form is not masked. So
+      # it is refused. The value is not shown.
+      secret_as_stored() {
+        if [ "$2" != "$3" ]; then
+          fail "$1" "$(secret_label "$1") holds whitespace. Store it as one line with no spaces or line breaks: the trimmed value would not be masked."
+        fi
+      }
+
+      require_path_env() { :; }
+
+      # run.sh puts the bin dir on PATH for publish.sh itself.
+      add_to_path() { :; }
+      ATC_ACTION_EOF_DOTENV_ADAPTER
+      cat > "$ATC_ACTION_DIR/platform-gitlab.sh" << 'ATC_ACTION_EOF_PLATFORM_GITLAB'
+      # shellcheck shell=bash
+      # The GitLab CI adapter of the atc action. The atc-publish job of
+      # gitlab/atc-publish.yml runs `run.sh gitlab`, and run.sh, install-atc.sh and
+      # publish.sh source this file. platform.sh lists the functions that an
+      # adapter defines. A user sets the inputs as include inputs and the secrets
+      # as CI/CD variables.
+
+      # shellcheck source=dotenv-adapter.sh disable=SC1091
+      . "${BASH_SOURCE[0]%/*}/dotenv-adapter.sh"
+
+      # "the token", or "token" with bare.
+      secret_label() {
+        if [ "${2:-}" = bare ]; then
+          printf '%s' "$1"
+        else
+          printf 'the %s' "$1"
+        fi
+      }
+
+      # "the channel input", or "channel" with bare.
+      input_name() {
+        if [ "${2:-}" = bare ]; then
+          printf '%s' "$1"
+        else
+          printf 'the %s input' "$1"
+        fi
+      }
+
+      token_hint() {
+        printf '%s' "Set the ATC_TOKEN variable to an operator API key. A protected variable reaches only a protected tag or branch, and an environment-scoped one only a job of that environment."
+      }
+
+      # The version is the tag or branch name, and the workspace is the project
+      # directory: the include names the dotenv report relative to it. The job id
+      # names the temp dir, so that after_script can remove it after a KILL.
+      # shellcheck disable=SC2034 # run.sh reads the three variables
+      run_defaults() {
+        default_version="${CI_COMMIT_REF_NAME:-}"
+        default_workspace="${CI_PROJECT_DIR:-}"
+        run_id="${CI_JOB_ID:-}"
+      }
+      ATC_ACTION_EOF_PLATFORM_GITLAB
+      status=0
+      bash "$ATC_ACTION_DIR/run.sh" gitlab || status=$?
+      rm -rf -- "$ATC_ACTION_DIR"
+      exit "$status"
+  # run.sh removes its temp dir on exit. A KILL runs no trap, and
+  # after_script is a new shell, so both dirs are named after the job id.
+  after_script:
+    - rm -rf -- "${TMPDIR:-/tmp}/atc-action-$CI_JOB_ID" "${TMPDIR:-/tmp}/atc-action-scripts-$CI_JOB_ID"
+  artifacts:
+    reports:
+      dotenv: atc-publish.env
